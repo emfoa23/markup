@@ -1,17 +1,29 @@
-# 주 1회 전국 판매점 마스터 동기화 (일요일 새벽, cron-job.org 가 dispatch).
+# 주 1회 전국 판매점 마스터 동기화 (일요일 04:30 KST, cron-job.org 가 dispatch).
 # upsert + 미출현 지점 closed 마킹(질의 단위 자기완결) — 전량 교체가 아니므로 배출 이력이 보존된다.
 #
-# 질의(시도)마다 별도 잡 = 별도 러너 IP 로 돈다. 한 러너가 17개 질의 약 1,480페이지를 순서대로 긁던
-# 구조는 IP 스로틀에 걸려 2026-08-23·08-30 두 번 모두 75분 timeout 으로 한 질의도 못 끝냈다
-# (백필 때 확인한 처방 = 질의 분할 dispatch, 런마다 새 IP). 질의는 자기완결이라 병렬·부분 실패에
-# 안전하다 — 완주한 질의만 upsert·closed 마킹하고, 실패한 질의는 다음 주에 다시 돈다.
+# 질의(시도)마다 별도 잡 = 별도 러너 IP. 한 러너가 17개 질의 약 1,480페이지를 순서대로 긁던 구조는 IP 스로틀에 걸려
+# 8/23·8/30 두 번 모두 75분 timeout 으로 한 질의도 못 끝냈다. 분할 뒤에도 잡의 약 10% 는 러너 IP 가 동행복권에 SYN
+# 단계에서 차단돼 첫 페이지부터 무응답이었고(9/6 대구·대전·전남, 9/13 전북) 같은 러너 안 재시도는 전부 무효였다.
+# 17잡이 한 번에 전부 성공할 확률은 약 12% 라 run 은 거의 매주 '실패'였다(2026-09-14 감사).
+#
+# 그래서 한 run 안에서 3단계까지 **새 러너에서 미완료 질의만** 다시 돈다:
+#   sync-1(전체) → remaining-1 → sync-2 → remaining-2 → sync-3 → verdict
+# 미완료 판정은 잡 상태가 아니라 DB 다(.github/actions/stores-remaining → scripts/stores-remaining.mjs: 실행 시작 이후
+# 갱신되지 않은 open 지점이 남은 시도). 각 단계 잡은 continue-on-error 라 run 의 성패는 verdict 하나가 정한다 —
+# 실패 메일은 3단계 뒤에도 미완료가 남을 때만 온다. 첫 페이지는 2회 프리플라이트(scripts/lib/dhlottery.mjs)라 차단
+# 러너는 약 30초 만에 물러나고, DB 5xx 는 클라이언트가 재시도한다(scripts/lib/supa.mjs). 잡당 실패율 10% 독립 가정에서
+# 한 run 완료 확률 ≈ 98%, 평시 약 25분·최악 약 40분.
 name: sync-stores
 
 on:
   workflow_dispatch:
     inputs:
       queries:
-        description: '질의 목록 JSON 배열(예: ["서울","경기"]) — 비우면 전국 17개 질의'
+        description: '질의 목록 JSON 배열(예: ["서울","경기"]) — 비우면 전국 17개 질의. 완료 판정도 이 범위 안에서 한다'
+        required: false
+        default: ""
+      simulate_fail:
+        description: '검증용 — 1단계에서 크롤 없이 즉시 실패시킬 질의 JSON 배열(예: ["세종"]). 2단계 재실행 경로 확인용, 평소 비움'
         required: false
         default: ""
 
@@ -21,12 +33,14 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read # remaining/verdict 가 run_started_at 을 읽는다
 
 jobs:
-  sync:
+  sync-1:
     runs-on: ubuntu-latest
-    # 가장 큰 질의(서울)도 페이지 pacing 포함 10분 안쪽. 30분을 넘기면 스로틀이라 다음 주에 맡긴다.
+    # 가장 큰 질의(경기 366페이지)도 페이지 pacing 포함 10분 안쪽. 30분을 넘기면 스로틀이라 다음 단계에 맡긴다.
     timeout-minutes: 30
+    continue-on-error: true
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -34,6 +48,11 @@ jobs:
         # scripts/lib/dhlottery.mjs MASTER_QUERIES 의 query 이름과 같아야 한다 ('전남광주' 통합 권역 포함).
         query: ${{ fromJSON(inputs.queries || '["서울","부산","대구","인천","대전","울산","세종","경기","강원","충북","충남","전북","경북","경남","제주","전남광주","전남"]') }}
     steps:
+      - name: 검증 훅 — simulate_fail 에 든 질의는 크롤 없이 실패
+        if: contains(fromJSON(inputs.simulate_fail || '[]'), matrix.query)
+        run: |
+          echo "::warning::simulate_fail — ${{ matrix.query }} 는 1단계에서 강제 실패(2단계 재실행 검증)"
+          exit 1
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -46,3 +65,111 @@ jobs:
           # 변경된 지점·회차 페이지만 정밀 무효화(/api/ops/revalidate) + IndexNow 알림용
           OPS_SECRET: ${{ secrets.OPS_SECRET }}
           SITE_URL: https://lottogen.click
+
+  remaining-1:
+    needs: sync-1
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      queries: ${{ steps.remaining.outputs.remaining }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: remaining
+        uses: ./.github/actions/stores-remaining
+        with:
+          supabase-url: ${{ secrets.SUPABASE_URL }}
+          supabase-service-role-key: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          target-queries: ${{ inputs.queries }}
+
+  sync-2:
+    needs: remaining-1
+    if: always() && needs.remaining-1.result == 'success' && needs.remaining-1.outputs.queries != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        query: ${{ fromJSON(needs.remaining-1.outputs.queries) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Sync store master (2단계, 새 러너) — ${{ matrix.query }}
+        run: node scripts/sync-stores.mjs "${{ matrix.query }}"
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPS_SECRET: ${{ secrets.OPS_SECRET }}
+          SITE_URL: https://lottogen.click
+
+  remaining-2:
+    needs: sync-2
+    if: always() && needs.sync-2.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      queries: ${{ steps.remaining.outputs.remaining }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: remaining
+        uses: ./.github/actions/stores-remaining
+        with:
+          supabase-url: ${{ secrets.SUPABASE_URL }}
+          supabase-service-role-key: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          target-queries: ${{ inputs.queries }}
+
+  sync-3:
+    needs: remaining-2
+    if: always() && needs.remaining-2.result == 'success' && needs.remaining-2.outputs.queries != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        query: ${{ fromJSON(needs.remaining-2.outputs.queries) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Sync store master (3단계, 새 러너) — ${{ matrix.query }}
+        run: node scripts/sync-stores.mjs "${{ matrix.query }}"
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          OPS_SECRET: ${{ secrets.OPS_SECRET }}
+          SITE_URL: https://lottogen.click
+
+  # run 의 성패를 정하는 유일한 잡 — 3단계 뒤에도 DB 기준 미완료가 남으면 실패(→ 실패 메일).
+  verdict:
+    needs: [remaining-1, sync-2, remaining-2, sync-3]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: 단계별 잡 결과 요약
+        run: |
+          {
+            echo "### 단계별 잡 결과"
+            echo
+            echo "| 잡 | 결과 |"
+            echo "|---|---|"
+            gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100" --paginate \
+              --jq '.jobs[] | select(.name | startswith("sync-")) | "| \(.name) | \(.conclusion // .status) |"'
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: ./.github/actions/stores-remaining
+        with:
+          supabase-url: ${{ secrets.SUPABASE_URL }}
+          supabase-service-role-key: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          target-queries: ${{ inputs.queries }}
+          assert-empty: "true"
