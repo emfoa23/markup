@@ -144,15 +144,16 @@ export function fetchWins(epsd) {
 }
 
 // 전국 판매점 마스터. perPage 는 10 고정으로 동작한다.
-// 크롤은 슬롯 시간에 쫓기지 않으므로(잡 30분) 재시도 예산을 넉넉히 준다 — 스로틀 차단은 2~3분씩 이어졌다(실측).
-// 8회·백오프 상한 30s = 페이지당 최악 약 4분.
+// 첫 페이지 = 러너 IP 차단 감지용 프리플라이트: 2회(약 30초)만 시도하고 실패시킨다. 차단은 SYN 단계라 같은 러너의
+// 재시도는 전부 무응답이고(2026-09-06·09-13 실측: 8회 240초), 워크플로가 새 러너에서 그 질의만 다시 돈다(sync-stores.yml).
+// 2페이지부터는 연결이 살아 있는 상태의 일시 장애라 넉넉히 참는다 — 8회·백오프 상한 30s = 페이지당 최악 약 4분.
 export function fetchMasterPage(sido, pageNum) {
   return getData("/prchsplcsrch/selectLtShp.do", {
     srchCtpvNm: sido,
     srchSggNm: "",
     pageNum,
     recordCountPerPage: 10,
-  }, { tries: 8, backoffCapMs: 30_000 });
+  }, pageNum === 1 ? { tries: 2, backoffCapMs: 10_000 } : { tries: 8, backoffCapMs: 30_000 });
 }
 
 const ymd = (s) => `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`;

@@ -1,4 +1,13 @@
 // Supabase PostgREST 클라이언트 (service role). 의존성 없이 fetch 만 사용.
+// 멱등 요청(GET/HEAD/PATCH/DELETE/upsert/RPC)의 5xx·네트워크 오류는 2·5·10s 백오프로 최대 4시도(규칙: retry-policy.mjs).
+// 요청 하나는 30s 를 넘기지 않는다 — 게이트웨이가 4.5~9s 에 끊는 것이 실측이라 매달릴 이유가 없다.
+import { shouldRetry } from "./retry-policy.mjs";
+import { sleep } from "./util.mjs";
+import { warn } from "./log.mjs";
+
+const RETRY_DELAYS_MS = [2000, 5000, 10000];
+const REQUEST_TIMEOUT_MS = 30_000;
+
 function need(name) {
   const v = process.env[name];
   if (!v) throw new Error(`missing env: ${name}`);
@@ -9,20 +18,34 @@ const URL_ = need("SUPABASE_URL");
 const KEY = need("SUPABASE_SERVICE_ROLE_KEY");
 
 async function rest(pathAndQuery, { method = "GET", body, prefer } = {}) {
-  const res = await fetch(`${URL_}/rest/v1/${pathAndQuery}`, {
-    method,
-    headers: {
-      apikey: KEY,
-      authorization: `Bearer ${KEY}`,
-      "content-type": "application/json",
-      ...(prefer ? { prefer } : {}),
-    },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  if (!res.ok) {
-    throw new Error(`${method} ${pathAndQuery} -> ${res.status} ${await res.text()}`);
+  const payload = body === undefined ? undefined : JSON.stringify(body);
+  for (let attempt = 1; ; attempt++) {
+    let status = null;
+    let detail;
+    try {
+      const res = await fetch(`${URL_}/rest/v1/${pathAndQuery}`, {
+        method,
+        headers: {
+          apikey: KEY,
+          authorization: `Bearer ${KEY}`,
+          "content-type": "application/json",
+          ...(prefer ? { prefer } : {}),
+        },
+        body: payload,
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      if (res.ok) return res;
+      status = res.status;
+      detail = await res.text();
+    } catch (e) {
+      detail = `${e?.name ?? "Error"}: ${e?.cause?.message ?? e?.message ?? e}`;
+    }
+    const label = `${method} ${pathAndQuery.slice(0, 300)} -> ${status ?? "network"} ${String(detail).slice(0, 300)}`;
+    if (attempt > RETRY_DELAYS_MS.length || !shouldRetry({ method, pathAndQuery, status })) throw new Error(label);
+    const delay = RETRY_DELAYS_MS[attempt - 1];
+    warn(`supabase retry ${attempt}/${RETRY_DELAYS_MS.length} in ${delay}ms: ${label}`);
+    await sleep(delay);
   }
-  return res;
 }
 
 async function json(res) {

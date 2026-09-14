@@ -34,8 +34,10 @@ cron-job.org (유일한 스케줄러)
   ├─ sync-draw    토 20:40~21:05 5분 간격 + 22:00/23:00 백스톱 + 일 10:00 KST (멱등 재시도)
   │    당첨결과(기대 회차 1회 조회로 신규 적재 + 지연 필드 재보정) → 생성번호 대조
   │    → 배출점(최신 회차 미적재 시 1회, 추첨 후 12시간 지난 실행은 최근 3회차 재대조) → ISR revalidate → IndexNow 핑
-  ├─ sync-stores  일요일 새벽 주 1회 — 전국 판매점 마스터 upsert + 미출현 지점 closed 마킹
+  ├─ sync-stores  일요일 04:30 주 1회 — 전국 판매점 마스터 upsert + 미출현 지점 closed 마킹
   │    질의(시도)마다 별도 잡·별도 러너 IP(matrix, 동시 2) — 한 러너 순차 긁기는 IP 스로틀로 timeout
+  │    한 run 안 3단계: 전체 → DB 기준 미완료 질의만 새 러너에서 재실행(×2) → verdict 가 성패를 정한다
+  │    (러너 IP 차단은 첫 페이지 2회 프리플라이트로 약 30초 만에 감지, 같은 러너 재시도는 무효라 새 러너로)
   │    갱신 전후 비교로 상호·주소·상태가 바뀐 지점·새 지점·폐점 지점만 골라 지점·회차 페이지 무효화 + IndexNow
   └─ keepalive    매일 — GET /api/ops/keepalive (Supabase 무료 pause 방지)
 ```
@@ -57,7 +59,9 @@ cron-job.org (유일한 스케줄러)
 - 회차별 1·2등 배출점 `/wnprchsplcsrch/selectLtWnShp.do?srchWnShpRnk=all&srchLtEpsd={회차}` — 262회차부터, 행=당첨 게임 1건
 - 전국 판매점 마스터 `/prchsplcsrch/selectLtShp.do?srchCtpvNm={시도}` — 시도는 짧은 이름("서울"), 페이지당 10건 고정
 - **캐시·무효화 정책**(2026-09-06, `lib/cache-policy.ts`): 데이터는 주 3회(토 sync-draw, 일 04:30 sync-stores, 일 10:00 재대조)만 바뀌므로 페이지 캐시(홈·회차·지점·공유·사이트맵·RSS)와 데이터 캐시(회차 목록·명당 순위·번호 통계 — 검색 파라미터를 읽어 페이지 캐시가 꺼지는 화면, `unstable_cache` 태그 draws/ranking/numbers)를 **7일**로 두고, 동기화가 **바뀐 것만** 지운다(`POST /api/ops/revalidate` body `{paths, tags}` — 경로·태그 허용 목록). 모든 회차·지점을 통째로 지우던 방식은 폐기. 변경 URL 집합은 `scripts/lib/changes.mjs` 가 만들고 무효화와 IndexNow 가 같은 목록을 쓴다(핵심 6 + 시도 17 + 번호별 같이 나온 번호 45 + 회차 + 그 주 배출 지점 전부). 비용 상한 = 페이지당 7일 1회 재생성.
-- **호출 정책·관측**(2026-09-05): 러너 IP 는 짧은 버스트에도 스로틀되므로 sync-draw 는 슬롯당 호출을 1~2회로 유지한다(기대 회차 1회 조회로 신규+지연 필드, 배출점은 최신 회차 미적재 시만). 전송은 **소켓 1개 keep-alive 재사용**(유휴 8s 닫힘) — 러너 스로틀은 요청 수가 아니라 **새 TCP 연결**에 걸린다(요청마다 새 연결이면 4~6개 뒤부터 SYN 이 버려져 15s 타임아웃 연속, 재사용하면 울산 40페이지 70초·실패 0, 2026-09-05 실측). 재시도는 4회·15s 타임아웃(TCP 연결 단계 포함)·백오프 1/4/9s(콜당 최악 ~75초), 마스터 크롤만 8회·상한 30s(`scripts/lib/dhlottery.mjs`). **모든 호출은 성공·실패를 불문하고 `dhlottery ok|fail <endpoint?query> <ms> (try i/n)` 한 줄**을 남기고 스크립트 단계 로그엔 `[+경과초]` 가 붙는다(`scripts/lib/log.mjs`) — Actions 로그만으로 어느 호출이 얼마나 막혔는지 복원할 수 있다. 검증 훅 `SYNC_NOW=<ISO>` 로 기대 회차·12시간 규칙을 임의 시점으로 시험한다.
+- **호출 정책·관측**(2026-09-05): 러너 IP 는 짧은 버스트에도 스로틀되므로 sync-draw 는 슬롯당 호출을 1~2회로 유지한다(기대 회차 1회 조회로 신규+지연 필드, 배출점은 최신 회차 미적재 시만). 전송은 **소켓 1개 keep-alive 재사용**(유휴 8s 닫힘) — 러너 스로틀은 요청 수가 아니라 **새 TCP 연결**에 걸린다(요청마다 새 연결이면 4~6개 뒤부터 SYN 이 버려져 15s 타임아웃 연속, 재사용하면 울산 40페이지 70초·실패 0, 2026-09-05 실측). 재시도는 4회·15s 타임아웃(TCP 연결 단계 포함)·백오프 1/4/9s(콜당 최악 ~75초), 마스터 크롤은 2페이지부터 8회·상한 30s, **첫 페이지만 2회**(러너 IP 가 SYN 단계에서 차단된 경우 같은 러너의 재시도는 전부 무응답이라 약 30초 만에 물러나고 워크플로가 새 러너에서 그 질의만 다시 돈다 — 2026-09-14, `scripts/lib/dhlottery.mjs`). **모든 호출은 성공·실패를 불문하고 `dhlottery ok|fail <endpoint?query> <ms> (try i/n)` 한 줄**을 남기고 스크립트 단계 로그엔 `[+경과초]` 가 붙는다(`scripts/lib/log.mjs`) — Actions 로그만으로 어느 호출이 얼마나 막혔는지 복원할 수 있다. 검증 훅 `SYNC_NOW=<ISO>` 로 기대 회차·12시간 규칙을 임의 시점으로 시험한다.
+- **DB 호출 재시도**(2026-09-14, `scripts/lib/supa.mjs`·`retry-policy.mjs`): 멱등 요청(GET/HEAD/PATCH/DELETE/upsert/RPC)의 5xx·네트워크 오류는 2·5·10s 백오프로 최대 4시도, 요청 타임아웃 30s. plain insert(store_wins 삽입)는 중복 위험이라 제외. 배경: 컴퓨트 애드온 없는 Nano 인스턴스(RAM 0.5GB)가 스왑에서 돌아오는 수 초 동안 Supabase Envoy 게이트웨이가 `504 {"message":"Gateway Timeout"}` 을 단발로 낸다(9/12~13 3건, DB 문장은 ≤98ms) — 몇 초 뒤 같은 요청은 성공한다.
+- **판매점 마스터 완료 판정**(2026-09-14, `scripts/stores-remaining.mjs`·`scripts/lib/completion.mjs`): 잡 상태가 아니라 DB 로 판단한다 — 실행 시작 이후 `master_seen_at` 이 갱신되지 않은 open 지점이 남은 시도(marks)가 있으면 그 질의는 미완료. 완주한 질의는 그 시도의 open 지점 전부에 시각을 찍고 미출현 지점을 closed 로 바꾸므로 부분 upsert·폐점 누락도 미완료로 잡힌다. marks 없는 '전남' 보조 질의는 best-effort. 로컬 감사: `RUN_STARTED_AT=<ISO> node scripts/stores-remaining.mjs`.
 
 ## 개발
 
@@ -164,7 +168,7 @@ hydration 이 안 돼 셀렉트·버튼이 반응하지 않는다), http 라 `cr
 ```sh
 node scripts/backfill.mjs all      # 전체 백필 — Actions 의 backfill 워크플로로도 dispatch 가능
 node scripts/sync-draw.mjs         # 주간 동기화 (Actions 가 실행하는 것과 동일)
-node scripts/sync-stores.mjs "서울,경기"   # 마스터 동기화(질의 부분집합, 비우면 전국) — Actions 는 질의별 matrix 잡, 입력 queries=["서울","경기"]
+node scripts/sync-stores.mjs "서울,경기"   # 마스터 동기화(질의 부분집합, 비우면 전국) — Actions 는 질의별 matrix 잡 3단계, 입력 queries=["서울","경기"]·검증용 simulate_fail=["세종"]
 node scripts/indexnow-bulk.mjs [--dry]  # 1회성: 사이트맵의 URL 전부를 IndexNow 로 알림(네이버·Bing). 주간 변경분은 동기화가 보낸다
 ```
 

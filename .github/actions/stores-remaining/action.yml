@@ -1,0 +1,40 @@
+name: stores-remaining
+description: 판매점 마스터 완료 판정(DB 기준) — 이 run 의 시작 이후 갱신되지 않은 open 지점이 남은 질의를 산출한다(scripts/stores-remaining.mjs)
+inputs:
+  supabase-url:
+    required: true
+  supabase-service-role-key:
+    required: true
+  target-queries:
+    description: 판정 범위(workflow_dispatch 의 queries 입력 그대로, 비우면 전국)
+    required: false
+    default: ""
+  assert-empty:
+    description: "true 면 미완료가 남을 때 실패한다(verdict 잡)"
+    required: false
+    default: "false"
+outputs:
+  remaining:
+    description: 미완료 질의 JSON 배열(예 ["부산","전북"], 없으면 [])
+    value: ${{ steps.remaining.outputs.remaining }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+    - name: 실행 시작 시각
+      id: run
+      shell: bash
+      run: echo "started_at=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" --jq .run_started_at)" >> "$GITHUB_OUTPUT"
+      env:
+        GH_TOKEN: ${{ github.token }}
+    - name: 완료 판정
+      id: remaining
+      shell: bash
+      run: node scripts/stores-remaining.mjs ${{ inputs.assert-empty == 'true' && '--assert-empty' || '' }}
+      env:
+        SUPABASE_URL: ${{ inputs.supabase-url }}
+        SUPABASE_SERVICE_ROLE_KEY: ${{ inputs.supabase-service-role-key }}
+        RUN_STARTED_AT: ${{ steps.run.outputs.started_at }}
+        TARGET_QUERIES: ${{ inputs.target-queries }}
